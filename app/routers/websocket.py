@@ -117,44 +117,43 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
                 continue
             input_data = await _build_input_data(target_agent, target_config, ws_request)
 
-            try:
-                await _call_agent(
-                    agent=target_agent,
-                    input_data=input_data,
-                    config=target_config,
-                    websocket=websocket)
-            except NeedsOauth2 as e:
+            # A run can need OAuth2 several times (e.g. a plan whose subtasks use
+            # different agents), so authenticate and resume until it completes.
+            while True:
                 try:
-                    await handle_oauth_authentication(e.agent_cfg.name, websocket)
-                except OAuth2Canceled as oauth_err:
-                    logging.debug(f"OAuth2 authentication cancelled: {oauth_err}")
-                    await _patch_tool_result(target_agent, target_config, "OAuth2 authentication was cancelled by the user.")
-                    continue
-                except Exception as oauth_err:
-                    logging.error(f"OAuth2 authentication failed")
-                    await websocket.send_text(f'<auth-error>{json.dumps({"message": str(oauth_err)})}</auth-error>')
-                    await _patch_tool_result(target_agent, target_config, f"OAuth2 authentication failed: {oauth_err}")
-                    continue
+                    await _call_agent(
+                        agent=target_agent,
+                        input_data=input_data,
+                        config=target_config,
+                        websocket=websocket)
+                    break
+                except NeedsOauth2 as e:
+                    try:
+                        await handle_oauth_authentication(e.agent_cfg.name, websocket)
+                    except OAuth2Canceled as oauth_err:
+                        logging.debug(f"OAuth2 authentication cancelled: {oauth_err}")
+                        await _patch_tool_result(target_agent, target_config, "OAuth2 authentication was cancelled by the user.")
+                        break
+                    except Exception as oauth_err:
+                        logging.error(f"OAuth2 authentication failed")
+                        await websocket.send_text(f'<auth-error>{json.dumps({"message": str(oauth_err)})}</auth-error>')
+                        await _patch_tool_result(target_agent, target_config, f"OAuth2 authentication failed: {oauth_err}")
+                        break
 
-                child_graph = await reload_agent_tools(llm, e.agent_cfg, websocket)
-                if isinstance(agent, SupervisorGraph):
-                    child_agent_obj = agent.child_agents.get(e.agent_cfg.name)
-                    if child_agent_obj:
-                        child_agent_obj.needs_oauth2 = False
-                        child_agent_obj.agent = child_graph
-                else:
-                    agent = child_graph
-                logging.debug(f"Successfully authenticated and reloaded agent '{e.agent_cfg.name}'")
+                    child_graph = await reload_agent_tools(llm, e.agent_cfg, websocket)
+                    if isinstance(agent, SupervisorGraph):
+                        child_agent_obj = agent.child_agents.get(e.agent_cfg.name)
+                        if child_agent_obj:
+                            child_agent_obj.needs_oauth2 = False
+                            child_agent_obj.agent = child_graph
+                    else:
+                        agent = child_graph
+                    logging.debug(f"Successfully authenticated and reloaded agent '{e.agent_cfg.name}'")
 
-                # Resume the agent from its last checkpoint (the tool call that
-                # triggered OAuth). Passing None lets LangGraph retry from the
-                # saved state rather than starting a new turn.
-                await _call_agent(
-                    agent=target_agent,
-                    input_data=None,
-                    config=target_config,
-                    websocket=websocket)
-
+                    # Resume the agent from its last checkpoint (the tool call that
+                    # triggered OAuth). Passing None lets LangGraph retry from the
+                    # saved state rather than starting a new turn.
+                    input_data = None
             
         except WebSocketDisconnect:
             logging.debug(f"Client disconnected.")
@@ -525,6 +524,7 @@ async def _build_input_data(agent: CompiledStateGraph, config: dict, ws_request:
     state = await agent.aget_state(config=config)
     
     if state.interrupts:
+        _restore_ui_tools_metadata(config, state)
         return Command(resume=ws_request.prompt)
 
     input_messages = [
@@ -541,3 +541,26 @@ async def _build_input_data(agent: CompiledStateGraph, config: dict, ws_request:
     return {
         "messages": input_messages,
     }
+
+
+def _restore_ui_tools_metadata(config: dict, state) -> None:
+    """Restore ``request_metadata.ui_tools`` from the interrupted turn on resume.
+
+    When the client answers a human-validation interrupt (e.g. ``"yes"``) it usually
+    omits the original ``tools`` payload, so ``_build_config`` rebuilds
+    ``request_metadata.ui_tools`` as empty. Any agent invoked later in the same turn
+    (e.g. a second agent in a multi-agent run) would then receive no UI tools config,
+    producing an empty confirmation preview. This restores the UI tools from the last
+    HumanMessage of the interrupted turn when the client did not resend them.
+    """
+    request_metadata = config.setdefault("configurable", {}).setdefault("request_metadata", {})
+    if request_metadata.get("ui_tools"):
+        return
+
+    for msg in reversed(state.values.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            previous = (getattr(msg, "additional_kwargs", {}) or {}).get("request_metadata", {})
+            previous_ui_tools = previous.get("ui_tools")
+            if previous_ui_tools:
+                request_metadata["ui_tools"] = previous_ui_tools
+            break
