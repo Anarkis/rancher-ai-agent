@@ -330,18 +330,34 @@ class MemoryManager:
                     "tags": tags,
                     "createdAt": message.additional_kwargs.get("created_at"),
                 })
-            elif message.type == 'ai' and message.content != "":
+            elif message.type == 'ai' and (message.content != "" or message.additional_kwargs.get("stopped")):
                 request_metadata = message.additional_kwargs.get("request_metadata", {})
 
-                rows.append({
-                    "chatId": chat_id,
-                    "role": "agent",
-                    "agent": request_metadata.get("agent", None),
-                    "message": (message.additional_kwargs.get("mcp_response") or "") + str(message.text),
-                    "tools": message.additional_kwargs.get("ui_tools", []),
-                    "tags": request_metadata.get("tags", []),
-                    "createdAt": message.additional_kwargs.get("created_at"),
-                })
+                # A stopped message is emitted as two rows (partial text, then an empty marker with
+                # "stopped") so the UI gets the same two messages as the live stream. Written by
+                # _record_stopped_in_history in routers/websocket.py. Keep both in sync.
+                if message.content != "":
+                    rows.append({
+                        "chatId": chat_id,
+                        "role": "agent",
+                        "agent": request_metadata.get("agent", None),
+                        "message": (message.additional_kwargs.get("mcp_response") or "") + str(message.text),
+                        "tools": message.additional_kwargs.get("ui_tools", []),
+                        "tags": request_metadata.get("tags", []),
+                        "createdAt": message.additional_kwargs.get("created_at"),
+                    })
+
+                if message.additional_kwargs.get("stopped"):
+                    rows.append({
+                        "chatId": chat_id,
+                        "role": "agent",
+                        "agent": request_metadata.get("agent", None),
+                        "message": "",
+                        "tools": [],
+                        "tags": request_metadata.get("tags", []),
+                        "stopped": message.additional_kwargs.get("stopped", ""),
+                        "createdAt": message.additional_kwargs.get("created_at"),
+                    })
             elif message.type == 'tool' and message.additional_kwargs.get("interrupt_message", "") != "":
                 rows.append({
                     "chatId": chat_id,

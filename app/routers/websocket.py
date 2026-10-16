@@ -2,13 +2,16 @@ import os
 import uuid
 import logging
 import json
+import asyncio
 from datetime import datetime
+from typing import Any
 
 from ..dependencies import get_llm
 from ..services.agent._constants import NoAgentAvailableError, NeedsOauth2
 from ..services.agent.factory import build_agent, reload_agent_tools
 from ..services.agent.loader import load_agent_configs
 from ..services.agent.supervisor import SupervisorGraph
+from ..services.agent.planner import format_stopped_plan_event
 from ..services.oauth2 import handle_oauth_authentication
 from ..services.oauth2.models import OAuth2Canceled
 from dataclasses import dataclass
@@ -18,11 +21,19 @@ from starlette.websockets import WebSocketState
 from langgraph.graph.state import CompiledStateGraph
 from langfuse.langchain import CallbackHandler
 from langchain_core.language_models.llms import BaseLanguageModel
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
 from ..services.auth import get_user_id_from_token
-from ..constants import CONTEXT_PARAMETERS_SUFFIX
+from ..constants import (
+    CONTEXT_PARAMETERS_SUFFIX,
+    STOP_TAG,
+    STOP_CANCEL_REPLY,
+    STOP_CONTEXT_REPLY,
+    STOP_REASON_MESSAGE_MANUAL,
+    STOP_REASON_PLANNING_MANUAL,
+    STOP_REASON_NEW_REQUEST,
+)
 
 router = APIRouter()
 
@@ -102,13 +113,25 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
         langfuse_handler = CallbackHandler()
         base_config["callbacks"] = [langfuse_handler]
 
+    # While an execution runs, _call_agent reads the socket to detect a new message.
+    # If one arrives, the run is cancelled and that already-read message is returned
+    # here so it is processed as the next request instead of being lost.
+    next_request = None
+
     while True:
         ws_request = None
+        message_opened = True
         try:
-            request = await websocket.receive_text()
+            request = next_request if next_request is not None else await websocket.receive_text()
+            next_request = None
             request_id = str(uuid.uuid4())
 
             ws_request = _parse_websocket_request(request)
+            if STOP_TAG in (ws_request.tags or []):
+                # Nothing is running, but a plan waiting for the user's input must be cancelled.
+                config = _build_config(base_config, request_id, ws_request)
+                message_opened = await _cancel_waiting_plan(agent, config, websocket)
+                continue
             if not ws_request.agent and single_agent_name:
                 ws_request.agent = single_agent_name
             config = _build_config(base_config, request_id, ws_request)
@@ -121,7 +144,7 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
             # different agents), so authenticate and resume until it completes.
             while True:
                 try:
-                    await _call_agent(
+                    next_request = await _call_agent(
                         agent=target_agent,
                         input_data=input_data,
                         config=target_config,
@@ -154,7 +177,7 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
                     # triggered OAuth). Passing None lets LangGraph retry from the
                     # saved state rather than starting a new turn.
                     input_data = None
-            
+
         except WebSocketDisconnect:
             logging.debug(f"Client disconnected.")
 
@@ -167,7 +190,7 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
             else:
                 break
         finally:
-            if websocket.client_state == WebSocketState.CONNECTED:
+            if message_opened and websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text("</message>")
 
 async def _handle_single_agent_oauth(
@@ -217,25 +240,289 @@ async def _patch_tool_result(agent: CompiledStateGraph, config: dict, error_mess
     await agent.aupdate_state(config=config, values={"messages": tool_messages})
 
 
+# Planner state reset when a run is stopped, so stale subtasks are not resumed or
+# mistaken for a subtask waiting for the user's answer on the next turn.
+_STOPPED_PLANNER_STATE = {
+    "subtasks": [],
+    "results": [],
+    "awaiting_input": False,
+    "cancelled": False,
+    "retry": False,
+    "feedback": [],
+}
+
+
+async def _close_stopped_thread(agent: CompiledStateGraph, config: dict, force: bool = False) -> None:
+    """
+    Close a stopped turn in the LLM-facing ``messages`` of a thread.
+
+    Cancelling a run can leave a pending tool call or a request with no reply. Both
+    are sent back to the LLM on the next turn, which would then resume the abandoned
+    request together with the new one. This patches any pending tool call and appends
+    an AIMessage stating the request was stopped. Planner keys present in the state
+    are reset too. Threads whose last message is already a final reply are untouched,
+    unless ``force`` is set (e.g. a plan waiting for the user's answer to a question).
+    """
+    await _patch_tool_result(agent, config, STOP_CANCEL_REPLY)
+
+    state = await agent.aget_state(config=config)
+    if not state or not state.values.get("messages"):
+        return
+    last_msg = state.values["messages"][-1]
+    if not force and isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+        return
+
+    values = {
+        key: value for key, value in _STOPPED_PLANNER_STATE.items() if key in state.values
+    }
+    values["messages"] = [
+        AIMessage(
+            content=STOP_CONTEXT_REPLY,
+            id=str(uuid.uuid4()),
+            additional_kwargs={"stopped": True, "created_at": datetime.now().isoformat()},
+        )
+    ]
+    await agent.aupdate_state(config=config, values=values)
+
+
+async def _close_stopped_run(agent: CompiledStateGraph | SupervisorGraph, config: dict, force: bool = False) -> None:
+    """
+    Close a stopped run in the target thread and in the threads of its child agents.
+
+    The in-flight tool call of a supervisor or planner run lives in the child agent's
+    own thread, namespaced as ``<thread_id>::child::<agent>`` by the supervisor and
+    ``<thread_id>::planner::<agent>`` by the planner, so those are closed as well.
+    ``force`` is passed to ``_close_stopped_thread``.
+    """
+    await _close_stopped_thread(agent, config, force)
+
+    if not isinstance(agent, SupervisorGraph):
+        return
+
+    thread_id = config["configurable"]["thread_id"]
+    for name, child in agent.child_agents.items():
+        if not child or not child.agent:
+            continue
+        for namespace in ("child", "planner"):
+            child_config = {
+                **config,
+                "configurable": {**config["configurable"], "thread_id": f"{thread_id}::{namespace}::{name}"},
+            }
+            await _close_stopped_thread(child.agent, child_config, force)
+
+
+async def _send_stopped_plan_event(agent: CompiledStateGraph | SupervisorGraph, config: dict, websocket: WebSocket) -> None:
+    """
+    Notify the client that the plan in the agent's thread was cancelled by a stop.
+
+    Must run before the planner state is reset by ``_close_stopped_run``. Agents that
+    are not planners have no ``subtasks`` in their state, so nothing is sent.
+    """
+    state = await agent.aget_state(config=config)
+    if not state:
+        return
+    if event := format_stopped_plan_event(state.values.get("subtasks")):
+        await websocket.send_text(event)
+
+
+async def _cancel_waiting_plan(agent: CompiledStateGraph | SupervisorGraph, config: dict, websocket: WebSocket) -> bool:
+    """
+    Cancel a plan that is waiting for the user when a stop arrives while nothing runs.
+
+    A plan waits either on an interrupt (plan approval or a child agent's confirmation)
+    or for the answer to a question asked by a subtask (``awaiting_input``). Without
+    cancelling it, the user's next message would be taken as that answer. The client is
+    sent the cancelled ``<plan>`` and a stop message inside a ``<message>`` block.
+
+    Returns:
+        True if a plan was cancelled and a ``<message>`` was opened (the caller closes it).
+    """
+    if not isinstance(agent, SupervisorGraph):
+        return False
+    state = await agent.aget_state(config=config)
+    if not state or not state.values.get("subtasks"):
+        return False
+    if not (state.interrupts or state.values.get("awaiting_input")):
+        return False
+
+    await websocket.send_text("<message>")
+    await _send_stopped_plan_event(agent, config, websocket)
+    await _close_stopped_run(agent, config, force=True)
+    await _record_stopped_in_history(agent, config, "", STOP_REASON_PLANNING_MANUAL)
+    await websocket.send_text(_build_stop_reply(STOP_REASON_PLANNING_MANUAL))
+
+    return True
+
+
+async def _record_stopped_in_history(agent: CompiledStateGraph, config: dict, partial_text: str, reason: str) -> None:
+    """
+    Record a stopped execution in ``messages_history`` so it shows up in the chat history.
+
+    Cancelling a run skips the MessagesHistoryMiddleware hooks, so the user's
+    message may be missing from the history and the partial answer is lost.
+    This adds the request's HumanMessage (if missing) and an AIMessage with the
+    partial streamed text flagged with ``stopped=<reason>``. Only ``messages_history``
+    is updated, so the stopped turn is not sent back to the LLM.
+    """
+    state = await agent.aget_state(config=config)
+    if not state:
+        return
+
+    # messages_history is a LastValue channel: the full list must be written.
+    history = list(state.values.get("messages_history", []))
+    history_ids = {getattr(m, "id", None) for m in history}
+
+    request_id = config["configurable"].get("request_id")
+    for msg in state.values.get("messages", []):
+        if (
+            isinstance(msg, HumanMessage)
+            and msg.additional_kwargs.get("request_id") == request_id
+            and msg.id not in history_ids
+        ):
+            history.append(msg)
+
+    # A single stored message yields up to two rows in the memory endpoint (partial text, then
+    # an empty "stopped" marker). See MemoryManager.fetch_messages in services/memory.py. Keep both in sync.
+    history.append(
+        AIMessage(
+            content=partial_text,
+            additional_kwargs={
+                "stopped": reason,
+                "created_at": datetime.now().isoformat(),
+                "request_metadata": config["configurable"].get("request_metadata", {}),
+            },
+        )
+    )
+    await agent.aupdate_state(config=config, values={"messages_history": history})
+
+
 async def _call_agent(
     agent: CompiledStateGraph,
-    input_data: any, 
+    input_data: Any,
     config: dict,
     websocket: WebSocket,
-) -> None:
+) -> str | None:
     """
     Streams the agent's response to a WebSocket connection, handling interruptions.
-    
+
+    The streaming runs as a cancellable task that is raced against an incoming
+    WebSocket message. If any message arrives while the agent is running, the
+    streaming task is cancelled (which aborts the in-flight LLM/tool call) and the
+    stopped turn is closed in the agent's (and its child agents') threads so the next
+    turn stays valid and does not resume the abandoned request.
+    The stopped run is recorded in ``messages_history`` and the client is notified
+    with a stop message carrying the reason. If the message carries the ``STOP_TAG``
+    tag it is just a stop request (``message-manual-stop``); otherwise it is a new request
+    that preempts the current run (``new-request``).
+
     Args:
         agent: The compiled LangGraph agent.
         input_data: The input data for the agent's run.
         config: The run configuration.
         websocket: The WebSocket connection.
-        stream_mode: The types of events to stream from the agent.
+
+    Returns:
+        The raw message that preempted the run so the caller can process it next,
+        or None if the run completed or was stopped.
     """
 
     await websocket.send_text("<message>")
-    
+
+    partial_text: list[str] = []
+    stream_task = asyncio.create_task(
+        _stream_agent_events(agent, input_data, config, websocket, partial_text)
+    )
+    receiver_task = asyncio.create_task(websocket.receive_text())
+
+    try:
+        done, _ = await asyncio.wait(
+            {stream_task, receiver_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if stream_task in done:
+            # Streaming finished (or raised); stop listening for new messages.
+            await _cancel_task(receiver_task)
+            # Re-raise any exception from the stream (e.g. NeedsOauth2) so the
+            # endpoint's error/OAuth handling still fires.
+            stream_task.result()
+            return None
+
+        # receiver_task completed: retrieve the message (may raise
+        # WebSocketDisconnect, which propagates to the endpoint's handler).
+        message = receiver_task.result()
+        await _cancel_task(stream_task)
+        await _send_stopped_plan_event(agent, config, websocket)
+        
+        # Check for plan in progress BEFORE clearing state
+        is_user_stop = STOP_TAG in (_parse_websocket_request(message).tags or [])
+        reason = STOP_REASON_MESSAGE_MANUAL
+        if is_user_stop:
+            # Only use planning-stop if there's an actual plan with subtasks in progress
+            if isinstance(agent, SupervisorGraph):
+                state = await agent.aget_state(config=config)
+                if state and state.values.get("subtasks"):
+                    reason = STOP_REASON_PLANNING_MANUAL
+        else:
+            reason = STOP_REASON_NEW_REQUEST
+        
+        await _close_stopped_run(agent, config)
+        await _record_stopped_in_history(agent, config, "".join(partial_text), reason)
+        await websocket.send_text(_build_stop_reply(reason))
+
+        if is_user_stop:
+            logging.debug("Received stop message; cancelled agent execution.")
+            return None
+
+        logging.debug("Received new message mid-run; cancelled agent execution to process it.")
+        return message
+    finally:
+        await _cancel_task(stream_task)
+        await _cancel_task(receiver_task)
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    """
+    Cancel a task and await it, suppressing the resulting ``CancelledError``.
+
+    Awaiting the cancelled task ensures the cancellation fully unwinds (aborting
+    any in-flight LLM/tool call or WebSocket receive) and that any pending
+    exception is retrieved so asyncio does not emit a "never retrieved" warning.
+    """
+    if task.done():
+        # Retrieve any exception to avoid an "exception never retrieved" warning.
+        # A cancelled task raises CancelledError from .exception(), so guard for it.
+        if not task.cancelled():
+            task.exception()
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _stream_agent_events(
+    agent: CompiledStateGraph,
+    input_data: Any,
+    config: dict,
+    websocket: WebSocket,
+    partial_text: list[str] | None = None,
+) -> None:
+    """
+    Streams the agent's events to a WebSocket connection.
+
+    Args:
+        agent: The compiled LangGraph agent.
+        input_data: The input data for the agent's run.
+        config: The run configuration.
+        websocket: The WebSocket connection.
+        partial_text: Optional buffer collecting the text streamed by the LLM call
+            in progress. It is cleared when the call ends, since the middleware
+            has then stored the response, so it only holds text that would be
+            lost if the run were cancelled.
+    """
+
     async for stream in agent.astream_events(
         input_data,
         config=config,
@@ -246,7 +533,13 @@ async def _call_agent(
                 continue
             if text := _extract_streaming_text(stream):
                 await websocket.send_text(text)
-        
+                if partial_text is not None:
+                    partial_text.append(text)
+
+        if stream["event"] == "on_chat_model_end":
+            if partial_text is not None and _should_stream_text(stream):
+                partial_text.clear()
+
         if stream["event"] == "on_custom_event":
             event_data = stream.get("data", "")
             # Send custom events as-is (they should already be formatted)
@@ -341,7 +634,7 @@ def _extract_interrupt_value(stream: dict) -> str | None:
         return value or None
     return json.dumps(value)
     
-def _extract_text_from_chunk_content(chunk_content: any) -> str:
+def _extract_text_from_chunk_content(chunk_content: Any) -> str:
     """
     Extracts the text content from a chunk received from the LLM.
 
@@ -541,6 +834,10 @@ async def _build_input_data(agent: CompiledStateGraph, config: dict, ws_request:
     return {
         "messages": input_messages,
     }
+
+def _build_stop_reply(reason: str) -> str:
+    """Builds the message sent to the client when a running execution has been stopped."""
+    return f"<stop-message>{json.dumps({'reason': reason})}</stop-message>"
 
 
 def _restore_ui_tools_metadata(config: dict, state) -> None:
