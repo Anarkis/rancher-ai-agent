@@ -255,7 +255,6 @@ def _fail_plan(
         RETRY_SUBTASK_REQUEST,
         RESTART_PLAN_REQUEST,
         REQUEST_FAILURE_DETAILS,
-        CANCEL_PLAN_REQUEST,
     ]
     if emit_plan:
         dispatch_custom_event(
@@ -365,7 +364,22 @@ def _format_plan_event(subtasks: list[dict], approval: bool, status: str | None 
 
     The global ``status`` is derived from the subtasks unless given explicitly.
     """
-    payload = {"tasks": subtasks, "approval": approval, "status": status or _plan_status(subtasks)}
+    
+    # Convert any actions in the subtasks into a tool call format for the client.
+    tasks = [
+        {
+            **st,
+            **({"tools": [
+                {
+                    "toolName": "select-option",
+                    "input": {f"option{i+1}": action for i, action in enumerate(st.get("actions", []))},
+                }
+            ]} if st.get("actions") else {}),
+        }
+        for st in subtasks
+    ]
+
+    payload = {"tasks": tasks, "approval": approval, "status": status or _plan_status(subtasks)}
     return f"<plan>{json.dumps(payload)}</plan>"
 
 
